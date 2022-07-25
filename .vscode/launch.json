@@ -1,0 +1,44 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Package",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${fileDirname}"
+        },
+        {
+            "name": "Debug-mrcoordinator",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/src/main/mrcoordinator.go",
+            "cwd": "${workspaceFolder}/src/main",
+            "args": ["pg-being_ernest.txt", "pg-dorian_gray.txt", "pg-frankenstein.txt"]
+        },
+        {
+            "name": "Debug-mrsquential",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/src/main/mrsequential.go",
+            "cwd": "${workspaceFolder}/src/main",
+            "args": ["wc.so", "pg-being_ernest.txt", "pg-dorian_gray.txt", "pg-frankenstein.txt"],
+            "preLaunchTask": "Build plugin"
+        },
+        {
+            "name": "Debug-mrworker",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/src/main/mrworker.go",
+            "cwd": "${workspaceFolder}/src/main",
+            "args": ["wc.so"],
+            "preLaunchTask": "Build plugin"
+        }
+    ]
+}
