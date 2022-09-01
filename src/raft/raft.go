@@ -42,6 +42,7 @@ import (
 //
 const (
 	HEARTBEAT_INTERVAL = 100
+	RPC_TIMEOUT        = 50
 	FOLLOWER           = 0
 	CANDIDATE          = 1
 	LEADER             = 2
@@ -101,8 +102,16 @@ func (rf *Raft) randomElectionTimeout() {
 	rf.electionTimeout = 200 + int(rf.rand.Int31n(300))
 }
 
+func (rf *Raft) electionTimeoutEquals(pre int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return pre == rf.electionTimeout
+}
+
 func (rf *Raft) fmt(a ...interface{}) {
+	rf.mu.Lock()
 	fmt.Println("Node", rf.me, "Term", rf.currentTerm, "votedFor", rf.votedFor, "commitIndex", rf.commitIndex, ":", a)
+	rf.mu.Unlock()
 }
 
 // return currentTerm and whether this server
@@ -112,29 +121,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-
-	// voteChan := make(chan int, len(rf.peers))
-	// args := AppendEntriesArgs{}
-	// args.Term = rf.currentTerm
-	// args.LeaderId = rf.me
-	// for i := 0; i < len(rf.peers); i += 1 {
-	// 	if i != rf.me {
-	// 		go func(i int) {
-	// 			reply := AppendEntriesReply{}
-	// 			ok := rf.sendAppendEntries(i, &args, &reply)
-	// 			if ok {
-	// 				if reply.Success {
-	// 					voteChan <- 0
-	// 				}
-	// 			}
-	// 		}(i)
-	// 	}
-	// }
-	// time.Sleep(time.Millisecond * time.Duration(50))
-	// close(voteChan)
-	// isleader = !rf.killed() && rf.votedFor == rf.me && len(voteChan)+1 > len(rf.peers)/2
+	rf.mu.Lock()
 	isleader = !rf.killed() && rf.role == LEADER && rf.votedFor == rf.me
 	term = rf.currentTerm
+	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -223,17 +213,13 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// rf.randomElectionTimeout()
-
+	rf.mu.Lock()
 	if args.Term > rf.currentTerm {
-		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.role = FOLLOWER
 		rf.votedFor = -1
-		rf.mu.Unlock()
-		rf.randomElectionTimeout()
 	}
-
+	rf.mu.Unlock()
 	rf.fmt("Receive RequestVote Request from Node", args.CandidateId, "Term", args.Term)
 
 	reply.VoteGranted = false
@@ -311,14 +297,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.votedFor = args.LeaderId
+	rf.mu.Unlock()
 	// Find the matched
+	rf.mu.Lock()
 	for index := 0; index < len(args.Entries); index += 1 {
 		if args.PrevLogIndex+index < len(rf.log) {
 			if rf.log[args.PrevLogIndex+index].Term != args.Entries[index].Term {
 				// conflic
-				rf.fmt("conflict")
 				logCopy := make([]LogEntry, args.PrevLogIndex)
 				copy(logCopy, rf.log[0:args.PrevLogIndex])
 				logCopy = append(logCopy, args.Entries...)
@@ -329,14 +315,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
-
+	rf.mu.Unlock()
+	rf.mu.Lock()
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = len(rf.log)
 		if args.LeaderCommit < rf.commitIndex {
 			rf.commitIndex = args.LeaderCommit
 		}
 	}
-
+	rf.mu.Unlock()
 	reply.Success = true
 	return
 }
@@ -429,17 +416,17 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) startElection() bool {
 
 	voteChannel := make(chan int, len(rf.peers)+1)
-
+	defer close(voteChannel)
 	rf.mu.Lock()
 	rf.role = CANDIDATE
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	voteChannel <- rf.currentTerm
 	rf.mu.Unlock()
+	voteChannel <- rf.currentTerm
 
 	rf.randomElectionTimeout()
 
-	timeout := 50
+	timeout := RPC_TIMEOUT
 	rf.fmt("Start a new Election with timeout", timeout)
 
 	// voteChannel <- rf.currentTerm
@@ -462,17 +449,16 @@ func (rf *Raft) startElection() bool {
 					rf.fmt("Receive reply from Node", i)
 					if reply.VoteGranted {
 						voteChannel <- reply.Term
-					} else {
-						rf.fmt("Not receive true from Node", i)
 					}
 					// Become follower
+					rf.mu.Lock()
 					if reply.Term > rf.currentTerm {
-						rf.mu.Lock()
 						rf.currentTerm = args.Term
 						rf.role = FOLLOWER
 						rf.votedFor = -1
-						rf.mu.Unlock()
 					}
+					rf.mu.Unlock()
+
 				} else {
 					rf.fmt("Error to receive reply of RequestVote from Node", i)
 				}
@@ -482,19 +468,18 @@ func (rf *Raft) startElection() bool {
 
 	rf.fmt("Sleep", timeout, "ms for Election")
 	time.Sleep(time.Millisecond * time.Duration(timeout))
-	close(voteChannel)
+	voteChannel <- -1
 	rf.fmt("Current election timeout")
 	voteCount := 0
 	for !rf.killed() && rf.votedFor == rf.me {
 		voteTerm, ok := <-voteChannel
-		if ok {
+		if ok && voteTerm >= 0 {
 			voteCount += 1
 			rf.fmt("Result of the Election, vote as Leader of Term ", voteTerm, ", vote count now is", voteCount)
 		} else {
 			break
 		}
 	}
-	// close(voteChannel)
 
 	result := voteCount > len(rf.peers)/2
 	rf.fmt("The Election result is", result)
@@ -512,11 +497,13 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		// Check heartbeat count during
+		rf.mu.Lock()
 		lastElectionTimeout := rf.electionTimeout
+		rf.mu.Unlock()
 		rf.fmt("Sleep", lastElectionTimeout, "ms")
 		time.Sleep(time.Duration(lastElectionTimeout) * time.Millisecond)
 
-		for rf.killed() == false && lastElectionTimeout == rf.electionTimeout {
+		for rf.killed() == false && rf.electionTimeoutEquals(lastElectionTimeout) {
 			// Become Candidate
 			// Start Election
 
@@ -549,12 +536,14 @@ func (rf *Raft) ticker() {
 								reply := AppendEntriesReply{}
 								ok := rf.sendAppendEntries(i, &args, &reply)
 								if ok {
+									rf.mu.Lock()
 									if reply.Term > rf.currentTerm {
 										rf.fmt("Becomes follower from Leader Node", i)
 										rf.mu.Lock()
 										rf.currentTerm = args.Term
 										rf.mu.Unlock()
 									}
+									rf.mu.Unlock()
 								}
 							}(i)
 						}
@@ -567,7 +556,7 @@ func (rf *Raft) ticker() {
 						rf.fmt("Stop sending HearBeats")
 						break
 					}
-					if lastElectionTimeout != rf.electionTimeout || rf.votedFor != rf.me {
+					if !rf.electionTimeoutEquals(lastElectionTimeout) || rf.votedFor != rf.me {
 						rf.fmt("Stop sending HearBeats")
 						break
 					}
