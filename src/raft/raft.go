@@ -95,23 +95,79 @@ type LogEntry struct {
 	Command interface{}
 }
 
-func (rf *Raft) randomElectionTimeout() {
-	rf.fmt("Reset the election timeout")
+func (rf *Raft) getRole() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.electionTimeout = 200 + int(rf.rand.Int31n(300))
+	return rf.role
 }
 
-func (rf *Raft) electionTimeoutEquals(pre int) bool {
+func (rf *Raft) setRole(role int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return pre == rf.electionTimeout
+	rf.role = role
+}
+
+func (rf *Raft) getCurrentTerm() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm
+}
+
+func (rf *Raft) setCurrentTerm(ct int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm = ct
+}
+
+func (rf *Raft) getVotedFor() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.votedFor
+}
+
+func (rf *Raft) setVotedFor(target int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votedFor = target
+}
+
+func (rf *Raft) getLog() []LogEntry {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.log
+}
+
+func (rf *Raft) getElectionTimeout() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.electionTimeout
+}
+
+func (rf *Raft) setElectionTimeout(timeout int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.electionTimeout = timeout
+}
+
+func (rf *Raft) getCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
+}
+
+func (rf *Raft) setCommitIndex(commitIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.commitIndex = commitIndex
+}
+
+func (rf *Raft) randomElectionTimeout() {
+	rf.fmt("Reset the election timeout")
+	rf.setElectionTimeout(200 + int(rf.rand.Int31n(300)))
 }
 
 func (rf *Raft) fmt(a ...interface{}) {
-	rf.mu.Lock()
-	fmt.Println("Node", rf.me, "Term", rf.currentTerm, "votedFor", rf.votedFor, "commitIndex", rf.commitIndex, ":", a)
-	rf.mu.Unlock()
+	fmt.Println("Node", rf.me, "Term", rf.getCurrentTerm(), "votedFor", rf.getVotedFor(), "commitIndex", rf.getCommitIndex(), ":", a)
 }
 
 // return currentTerm and whether this server
@@ -121,10 +177,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	rf.mu.Lock()
-	isleader = !rf.killed() && rf.role == LEADER && rf.votedFor == rf.me
-	term = rf.currentTerm
-	rf.mu.Unlock()
+	isleader = !rf.killed() && rf.getRole() == LEADER && rf.getVotedFor() == rf.me
+	term = rf.getCurrentTerm()
 	return term, isleader
 }
 
@@ -213,29 +267,24 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = FOLLOWER
-		rf.votedFor = -1
+	if args.Term > rf.getCurrentTerm() {
+		rf.setCurrentTerm(args.Term)
+		rf.setRole(FOLLOWER)
+		rf.setVotedFor(-1)
 	}
-	rf.mu.Unlock()
 	rf.fmt("Receive RequestVote Request from Node", args.CandidateId, "Term", args.Term)
 
 	reply.VoteGranted = false
 
-	if rf.currentTerm > args.Term {
+	if rf.getCurrentTerm() > args.Term {
 		return
 	}
+	vf := rf.getVotedFor()
 
-	rf.fmt("State before vote:", "rf.votedFor", rf.votedFor, "args.CandidateId", args.CandidateId, "args.LastLogTerm", args.LastLogTerm, "args.LastLogIndex", args.LastLogIndex, "len(rf.log)", len(rf.log))
-	rf.fmt(rf.votedFor == -1 || rf.votedFor == args.CandidateId, args.LastLogIndex >= len(rf.log))
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogIndex >= len(rf.log) {
+	if (vf == -1 || vf == args.CandidateId) && args.LastLogIndex >= len(rf.getLog()) {
 		reply.VoteGranted = true
-		reply.Term = rf.currentTerm
-		rf.mu.Lock()
-		rf.votedFor = args.CandidateId
-		rf.mu.Unlock()
+		reply.Term = rf.getCurrentTerm()
+		rf.setVotedFor(args.CandidateId)
 		rf.randomElectionTimeout()
 	}
 	rf.fmt("Vote ", reply.VoteGranted, "for Node", args.CandidateId)
@@ -268,37 +317,32 @@ type AppendEntriesReply struct {
 // example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
-	if args.Term > rf.currentTerm {
-		rf.mu.Lock()
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.role = FOLLOWER
-		rf.mu.Unlock()
+	if args.Term > rf.getCurrentTerm() {
+		rf.setCurrentTerm(args.Term)
+		rf.setVotedFor(-1)
+		rf.setRole(FOLLOWER)
 		rf.randomElectionTimeout()
 	}
 
 	rf.fmt("Receive AppendEntries Request from Node", args.LeaderId, "Term", args.Term)
 
-	reply.Term = rf.currentTerm
+	reply.Term = rf.getCurrentTerm()
 	reply.Success = false
 
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.getCurrentTerm() {
 		return
 	}
 
 	rf.randomElectionTimeout()
 
-	entries_length := len(rf.log)
+	entries_length := len(rf.getLog())
 
-	if entries_length < args.PrevLogIndex || args.PrevLogIndex-1 >= 0 && rf.log[args.PrevLogIndex-1].Term != args.PreLogTerm {
+	if entries_length < args.PrevLogIndex || args.PrevLogIndex-1 >= 0 && rf.getLog()[args.PrevLogIndex-1].Term != args.PreLogTerm {
 		reply.Success = false
 		return
 	}
 
-	rf.mu.Lock()
-	rf.votedFor = args.LeaderId
-	rf.mu.Unlock()
+	rf.setVotedFor(args.LeaderId)
 	// Find the matched
 	rf.mu.Lock()
 	for index := 0; index < len(args.Entries); index += 1 {
@@ -316,14 +360,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	rf.mu.Unlock()
-	rf.mu.Lock()
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = len(rf.log)
-		if args.LeaderCommit < rf.commitIndex {
-			rf.commitIndex = args.LeaderCommit
+	if args.LeaderCommit > rf.getCommitIndex() {
+		rf.setCommitIndex(len(rf.getLog()))
+		if args.LeaderCommit < rf.getCommitIndex() {
+			rf.setCommitIndex(args.LeaderCommit)
 		}
 	}
-	rf.mu.Unlock()
 	reply.Success = true
 	return
 }
@@ -417,30 +459,27 @@ func (rf *Raft) startElection() bool {
 
 	voteChannel := make(chan int, len(rf.peers)+1)
 	defer close(voteChannel)
-	rf.mu.Lock()
-	rf.role = CANDIDATE
-	rf.currentTerm += 1
-	rf.votedFor = rf.me
-	rf.mu.Unlock()
+	rf.setRole(CANDIDATE)
+	rf.setCurrentTerm(rf.getCurrentTerm() + 1)
+	rf.setVotedFor(rf.me)
 	voteChannel <- rf.currentTerm
 
 	rf.randomElectionTimeout()
 
-	timeout := RPC_TIMEOUT
-	rf.fmt("Start a new Election with timeout", timeout)
+	rf.fmt("Start a new Election with timeout", RPC_TIMEOUT)
 
 	// voteChannel <- rf.currentTerm
 	for i := 0; i < len(rf.peers) && !rf.killed(); i += 1 {
 		go func(i int) {
 			if i != rf.me {
 				args := RequestVoteArgs{}
-				args.Term = rf.currentTerm
+				args.Term = rf.getCurrentTerm()
 				args.CandidateId = rf.me
-				args.LastLogIndex = len(rf.log)
+				args.LastLogIndex = len(rf.getLog())
 				if args.LastLogIndex == 0 {
 					args.LastLogTerm = 0
 				} else {
-					args.LastLogTerm = rf.log[args.LastLogIndex-1].Term
+					args.LastLogTerm = rf.getLog()[args.LastLogIndex-1].Term
 				}
 				reply := RequestVoteReply{}
 				rf.fmt("Send vote Requset to Node", i)
@@ -451,13 +490,11 @@ func (rf *Raft) startElection() bool {
 						voteChannel <- reply.Term
 					}
 					// Become follower
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = args.Term
-						rf.role = FOLLOWER
-						rf.votedFor = -1
+					if reply.Term > rf.getCurrentTerm() {
+						rf.setCurrentTerm(args.Term)
+						rf.setRole(FOLLOWER)
+						rf.setVotedFor(-1)
 					}
-					rf.mu.Unlock()
 
 				} else {
 					rf.fmt("Error to receive reply of RequestVote from Node", i)
@@ -466,12 +503,12 @@ func (rf *Raft) startElection() bool {
 		}(i)
 	}
 
-	rf.fmt("Sleep", timeout, "ms for Election")
-	time.Sleep(time.Millisecond * time.Duration(timeout))
+	rf.fmt("Sleep", RPC_TIMEOUT, "ms for Election")
+	time.Sleep(time.Millisecond * time.Duration(RPC_TIMEOUT))
 	voteChannel <- -1
 	rf.fmt("Current election timeout")
 	voteCount := 0
-	for !rf.killed() && rf.votedFor == rf.me {
+	for !rf.killed() && rf.getVotedFor() == rf.me {
 		voteTerm, ok := <-voteChannel
 		if ok && voteTerm >= 0 {
 			voteCount += 1
@@ -497,36 +534,31 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		// Check heartbeat count during
-		rf.mu.Lock()
-		lastElectionTimeout := rf.electionTimeout
-		rf.mu.Unlock()
+		lastElectionTimeout := rf.getElectionTimeout()
 		rf.fmt("Sleep", lastElectionTimeout, "ms")
 		time.Sleep(time.Duration(lastElectionTimeout) * time.Millisecond)
 
-		for rf.killed() == false && rf.electionTimeoutEquals(lastElectionTimeout) {
+		for rf.killed() == false && rf.getElectionTimeout() == lastElectionTimeout {
 			// Become Candidate
 			// Start Election
-
 			rf.fmt("HeartBeat timeout, becomes Candidate!")
 			electionResult := rf.startElection()
 			if electionResult {
 				rf.fmt("Win the election, becomes Leader")
 
-				rf.mu.Lock()
 				// reinitialize leader's volatile state
-				rf.role = LEADER
+				rf.setRole(LEADER)
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
 				for i := 0; i < len(rf.peers); i += 1 {
 					rf.nextIndex[i] = 1 + len(rf.peers)
 				}
-				rf.mu.Unlock()
 
 				for !rf.killed() {
 					// heartBeatCh := make(chan bool, len(rf.peers)+1)
 					// defer close(heartBeatCh)
 					args := AppendEntriesArgs{}
-					args.Term = rf.currentTerm
+					args.Term = rf.getCurrentTerm()
 					args.LeaderId = rf.me
 					// Send HeartBeat
 					for i := 0; i < len(rf.peers); i += 1 {
@@ -536,14 +568,10 @@ func (rf *Raft) ticker() {
 								reply := AppendEntriesReply{}
 								ok := rf.sendAppendEntries(i, &args, &reply)
 								if ok {
-									rf.mu.Lock()
-									if reply.Term > rf.currentTerm {
+									if reply.Term > rf.getCurrentTerm() {
 										rf.fmt("Becomes follower from Leader Node", i)
-										rf.mu.Lock()
-										rf.currentTerm = args.Term
-										rf.mu.Unlock()
+										rf.setCurrentTerm(args.Term)
 									}
-									rf.mu.Unlock()
 								}
 							}(i)
 						}
@@ -556,7 +584,7 @@ func (rf *Raft) ticker() {
 						rf.fmt("Stop sending HearBeats")
 						break
 					}
-					if !rf.electionTimeoutEquals(lastElectionTimeout) || rf.votedFor != rf.me {
+					if rf.getElectionTimeout() != lastElectionTimeout || rf.getVotedFor() != rf.me {
 						rf.fmt("Stop sending HearBeats")
 						break
 					}
