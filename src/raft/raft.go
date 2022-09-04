@@ -472,7 +472,7 @@ func (rf *Raft) startElection() bool {
 
 	rf.randomElectiontimeout()
 
-	rf.logger(logger.DVote, "Start a new Election with timeout", RPC_timeout)
+	rf.logger(logger.DVote, "Start a new Election with timeout ", RPC_timeout)
 
 	// voteChannel <- rf.currentTerm
 	for i := 0; i < len(rf.peers) && !rf.killed(); i += 1 {
