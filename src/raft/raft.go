@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"fmt"
 	"math/rand"
 	"sync"
@@ -27,6 +28,7 @@ import (
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"6.824/logger"
 )
 
 //
@@ -42,7 +44,7 @@ import (
 //
 const (
 	HEARTBEAT_INTERVAL = 100
-	RPC_TIMEOUT        = 50
+	RPC_timeout        = 50
 	FOLLOWER           = 0
 	CANDIDATE          = 1
 	LEADER             = 2
@@ -87,7 +89,7 @@ type Raft struct {
 
 	rand              *rand.Rand
 	heartbeatInterval int
-	electionTimeout   int
+	electiontimeout   int
 }
 
 type LogEntry struct {
@@ -137,16 +139,16 @@ func (rf *Raft) getLog() []LogEntry {
 	return rf.log
 }
 
-func (rf *Raft) getElectionTimeout() int {
+func (rf *Raft) getElectiontimeout() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.electionTimeout
+	return rf.electiontimeout
 }
 
-func (rf *Raft) setElectionTimeout(timeout int) {
+func (rf *Raft) setElectiontimeout(timeout int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.electionTimeout = timeout
+	rf.electiontimeout = timeout
 }
 
 func (rf *Raft) getCommitIndex() int {
@@ -161,13 +163,17 @@ func (rf *Raft) setCommitIndex(commitIndex int) {
 	rf.commitIndex = commitIndex
 }
 
-func (rf *Raft) randomElectionTimeout() {
-	rf.fmt("Reset the election timeout")
-	rf.setElectionTimeout(200 + int(rf.rand.Int31n(300)))
+func (rf *Raft) randomElectiontimeout() {
+	rf.logger(logger.DTimer, "Reset the election timeout")
+	rf.setElectiontimeout(200 + int(rf.rand.Int31n(300)))
 }
 
-func (rf *Raft) fmt(a ...interface{}) {
-	fmt.Println("Node", rf.me, "Term", rf.getCurrentTerm(), "votedFor", rf.getVotedFor(), "commitIndex", rf.getCommitIndex(), ":", a)
+func (rf *Raft) logger(topic logger.LogTopic, a ...interface{}) {
+	// content := fmt.Printf("Node", rf.me, "Term", rf.getCurrentTerm(), "votedFor", rf.getVotedFor(), "commitIndex", rf.getCommitIndex(), ":", a)
+	// pre := fmt.Sprintf("N:%dT:%dV:%d: ", rf.me, rf.getCurrentTerm(), rf.getVotedFor())
+	pre := fmt.Sprintf("N%v ", rf.me)
+	content := fmt.Sprint(a...)
+	logger.Debug(topic, pre+content)
 }
 
 // return currentTerm and whether this server
@@ -272,7 +278,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.setRole(FOLLOWER)
 		rf.setVotedFor(-1)
 	}
-	rf.fmt("Receive RequestVote Request from Node", args.CandidateId, "Term", args.Term)
+	rf.logger(logger.DVote, "Receive RequestVote Request from N", args.CandidateId, "T", args.Term)
 
 	reply.VoteGranted = false
 
@@ -285,9 +291,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.Term = rf.getCurrentTerm()
 		rf.setVotedFor(args.CandidateId)
-		rf.randomElectionTimeout()
+		rf.randomElectiontimeout()
 	}
-	rf.fmt("Vote ", reply.VoteGranted, "for Node", args.CandidateId)
+	rf.logger(logger.DVote, "Vote ", reply.VoteGranted, "for N", args.CandidateId)
 	return
 }
 
@@ -321,10 +327,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.setCurrentTerm(args.Term)
 		rf.setVotedFor(-1)
 		rf.setRole(FOLLOWER)
-		rf.randomElectionTimeout()
+		rf.randomElectiontimeout()
 	}
 
-	rf.fmt("Receive AppendEntries Request from Node", args.LeaderId, "Term", args.Term)
+	rf.logger(logger.DClient, "Receive AppendEntries Request from N", args.LeaderId, " T", args.Term)
 
 	reply.Term = rf.getCurrentTerm()
 	reply.Success = false
@@ -333,7 +339,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.randomElectionTimeout()
+	rf.randomElectiontimeout()
 
 	entries_length := len(rf.getLog())
 
@@ -447,7 +453,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.fmt("Killed")
+	rf.logger(logger.DInfo, "Killed")
 }
 
 func (rf *Raft) killed() bool {
@@ -464,9 +470,9 @@ func (rf *Raft) startElection() bool {
 	rf.setVotedFor(rf.me)
 	voteChannel <- rf.currentTerm
 
-	rf.randomElectionTimeout()
+	rf.randomElectiontimeout()
 
-	rf.fmt("Start a new Election with timeout", RPC_TIMEOUT)
+	rf.logger(logger.DVote, "Start a new Election with timeout", RPC_timeout)
 
 	// voteChannel <- rf.currentTerm
 	for i := 0; i < len(rf.peers) && !rf.killed(); i += 1 {
@@ -482,10 +488,10 @@ func (rf *Raft) startElection() bool {
 					args.LastLogTerm = rf.getLog()[args.LastLogIndex-1].Term
 				}
 				reply := RequestVoteReply{}
-				rf.fmt("Send vote Requset to Node", i)
+				rf.logger(logger.DVote, "Send vote Requset to N", i)
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok {
-					rf.fmt("Receive reply from Node", i)
+					rf.logger(logger.DVote, "Receive reply from N", i)
 					if reply.VoteGranted {
 						voteChannel <- reply.Term
 					}
@@ -497,29 +503,29 @@ func (rf *Raft) startElection() bool {
 					}
 
 				} else {
-					rf.fmt("Error to receive reply of RequestVote from Node", i)
+					rf.logger(logger.DVote, "Error to receive reply of RequestVote from N", i)
 				}
 			}
 		}(i)
 	}
 
-	rf.fmt("Sleep", RPC_TIMEOUT, "ms for Election")
-	time.Sleep(time.Millisecond * time.Duration(RPC_TIMEOUT))
+	rf.logger(logger.DVote, "Sleep ", RPC_timeout, "ms for Election")
+	time.Sleep(time.Millisecond * time.Duration(RPC_timeout))
 	voteChannel <- -1
-	rf.fmt("Current election timeout")
+	rf.logger(logger.DVote, "Current election timeout")
 	voteCount := 0
 	for !rf.killed() && rf.getVotedFor() == rf.me {
 		voteTerm, ok := <-voteChannel
 		if ok && voteTerm >= 0 {
 			voteCount += 1
-			rf.fmt("Result of the Election, vote as Leader of Term ", voteTerm, ", vote count now is", voteCount)
+			rf.logger(logger.DVote, "Result of the Election, vote as Leader of T", voteTerm, ", vote count now is ", voteCount)
 		} else {
 			break
 		}
 	}
 
 	result := voteCount > len(rf.peers)/2
-	rf.fmt("The Election result is", result)
+	rf.logger(logger.DVote, "The Election result is ", result)
 
 	return result
 }
@@ -534,17 +540,17 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		// Check heartbeat count during
-		lastElectionTimeout := rf.getElectionTimeout()
-		rf.fmt("Sleep", lastElectionTimeout, "ms")
-		time.Sleep(time.Duration(lastElectionTimeout) * time.Millisecond)
+		lastElectiontimeout := rf.getElectiontimeout()
+		rf.logger(logger.DTimer, "Sleep ", lastElectiontimeout, "ms")
+		time.Sleep(time.Duration(lastElectiontimeout) * time.Millisecond)
 
-		for rf.killed() == false && rf.getElectionTimeout() == lastElectionTimeout {
+		for rf.killed() == false && rf.getElectiontimeout() == lastElectiontimeout {
 			// Become Candidate
 			// Start Election
-			rf.fmt("HeartBeat timeout, becomes Candidate!")
+			rf.logger(logger.DWarn, "HeartBeat timeout, becomes Candidate!")
 			electionResult := rf.startElection()
 			if electionResult {
-				rf.fmt("Win the election, becomes Leader")
+				rf.logger(logger.DLeader, "Win the election, becomes Leader")
 
 				// reinitialize leader's volatile state
 				rf.setRole(LEADER)
@@ -563,13 +569,13 @@ func (rf *Raft) ticker() {
 					// Send HeartBeat
 					for i := 0; i < len(rf.peers); i += 1 {
 						if i != rf.me {
-							rf.fmt("Send HeartBeart to Node", i)
+							rf.logger(logger.DLeader, "Send HeartBeart to N", i)
 							go func(i int) {
 								reply := AppendEntriesReply{}
 								ok := rf.sendAppendEntries(i, &args, &reply)
 								if ok {
 									if reply.Term > rf.getCurrentTerm() {
-										rf.fmt("Becomes follower from Leader Node", i)
+										rf.logger(logger.DWarn, "Becomes follower of Leader N", i)
 										rf.setCurrentTerm(args.Term)
 									}
 								}
@@ -580,12 +586,11 @@ func (rf *Raft) ticker() {
 					time.Sleep(time.Duration(rf.heartbeatInterval) * time.Millisecond)
 
 					if rf.killed() {
-						rf.fmt("Get Killed")
-						rf.fmt("Stop sending HearBeats")
+						rf.logger(logger.DWarn, "Get Killed, stop sending HearBeats")
 						break
 					}
-					if rf.getElectionTimeout() != lastElectionTimeout || rf.getVotedFor() != rf.me {
-						rf.fmt("Stop sending HearBeats")
+					if rf.getElectiontimeout() != lastElectiontimeout || rf.getVotedFor() != rf.me {
+						rf.logger(logger.DWarn, "Stop sending HearBeats")
 						break
 					}
 				}
@@ -628,8 +633,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.rand = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
 	rf.heartbeatInterval = HEARTBEAT_INTERVAL
 
-	// rf.randomElectionTimeout()
-	rf.fmt("Make a newborn")
+	// rf.randomElectiontimeout()
+	rf.logger(logger.DInfo, "Make a newborn")
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
