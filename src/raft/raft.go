@@ -21,12 +21,14 @@ import (
 	//	"bytes"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"6.824/logger"
 )
 
 //
@@ -41,12 +43,25 @@ import (
 // other uses.
 //
 const (
-	HEARTBEAT_INTERVAL = 100
-	RPC_TIMEOUT        = 50
-	FOLLOWER           = 0
-	CANDIDATE          = 1
-	LEADER             = 2
+	HEARTBEAT_INTERVAL    = 100
+	RPC_timeout           = 50
+	FOLLOWER              = 0
+	CANDIDATE             = 1
+	LEADER                = 2
+	LIMITED_ENTRIES_COUNT = 5
 )
+
+func getRoleName(code int) string {
+	if code == 0 {
+		return "FOLLOWER"
+	} else if code == 1 {
+		return "CANDIDATE"
+	} else if code == 2 {
+		return "LEADER"
+	} else {
+		return "UNKNOWN"
+	}
+}
 
 type ApplyMsg struct {
 	CommandValid bool
@@ -87,7 +102,9 @@ type Raft struct {
 
 	rand              *rand.Rand
 	heartbeatInterval int
-	electionTimeout   int
+	electiontimeout   int
+
+	applyCh chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -104,7 +121,11 @@ func (rf *Raft) getRole() int {
 func (rf *Raft) setRole(role int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.role = role
+	preRole := rf.role
+	if preRole != role {
+		rf.role = role
+		rf.logger(logger.DInfo, "Role change: ", getRoleName(preRole), " -> ", getRoleName(role))
+	}
 }
 
 func (rf *Raft) getCurrentTerm() int {
@@ -137,16 +158,16 @@ func (rf *Raft) getLog() []LogEntry {
 	return rf.log
 }
 
-func (rf *Raft) getElectionTimeout() int {
+func (rf *Raft) getElectiontimeout() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.electionTimeout
+	return rf.electiontimeout
 }
 
-func (rf *Raft) setElectionTimeout(timeout int) {
+func (rf *Raft) setElectiontimeout(timeout int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.electionTimeout = timeout
+	rf.electiontimeout = timeout
 }
 
 func (rf *Raft) getCommitIndex() int {
@@ -155,19 +176,103 @@ func (rf *Raft) getCommitIndex() int {
 	return rf.commitIndex
 }
 
-func (rf *Raft) setCommitIndex(commitIndex int) {
+func (rf *Raft) appendLogEntriesAt(start int, entries []LogEntry) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.commitIndex = commitIndex
+	rf.log = append(rf.log[:start], entries...)
 }
 
-func (rf *Raft) randomElectionTimeout() {
-	rf.fmt("Reset the election timeout")
-	rf.setElectionTimeout(200 + int(rf.rand.Int31n(300)))
+func (rf *Raft) appendLogEntries(entries []LogEntry) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.log = append(rf.log, entries...)
 }
 
-func (rf *Raft) fmt(a ...interface{}) {
-	fmt.Println("Node", rf.me, "Term", rf.getCurrentTerm(), "votedFor", rf.getVotedFor(), "commitIndex", rf.getCommitIndex(), ":", a)
+func (rf *Raft) removeFollowingLogEntries(start int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.log = rf.log[:start]
+}
+
+func (rf *Raft) getNextIndex(index int) int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.nextIndex[index]
+}
+
+func (rf *Raft) getNextIndexAll() []int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.nextIndex
+}
+
+func (rf *Raft) setNextIndex(index int, value int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	preValue := rf.nextIndex[index]
+	if preValue != value {
+		rf.nextIndex[index] = value
+		rf.logger(logger.DLog, "nextIndex[", index, "] ", preValue, " -> ", value)
+	}
+}
+
+func (rf *Raft) getMatchIndexAll() []int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.matchIndex
+}
+
+func (rf *Raft) getMatchIndex(index int) int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.matchIndex[index]
+}
+
+func (rf *Raft) setMatchIndex(index int, value int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	preValue := rf.matchIndex[index]
+	if preValue > value {
+		rf.logger(logger.DError, "Fail to change MatchIndex[", index, "]: ", preValue, " -> ", value, "MatchIndex is monotonical!")
+	}
+	if preValue != value {
+		rf.matchIndex[index] = value
+		rf.logger(logger.DLog, "matchIndex[", index, "] ", preValue, " -> ", value)
+	}
+}
+
+func (rf *Raft) setCommitIndex(commitIndex int) {
+	var preCommitIndex int
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	preCommitIndex = rf.commitIndex
+	if preCommitIndex > commitIndex {
+		rf.logger(logger.DError, "Fail to change CommitIndex ", preCommitIndex, " -> ", commitIndex, "CommitIndex is monotonical!")
+	}
+	if preCommitIndex != commitIndex {
+		rf.commitIndex = commitIndex
+		rf.logger(logger.DCommit, "CommitIndex ", preCommitIndex, " -> ", commitIndex)
+
+		for i := preCommitIndex + 1; i <= rf.commitIndex; i += 1 {
+			am := ApplyMsg{}
+			am.CommandValid = true
+			am.CommandIndex = i
+			am.Command = rf.log[i-1].Command
+			rf.applyCh <- am
+			rf.logger(logger.DCommit, "Send ApplyMsg to applyCh for command index ", i, " Command = ", am.Command)
+		}
+	}
+}
+
+func (rf *Raft) randomElectiontimeout() {
+	rf.setElectiontimeout(200 + int(rf.rand.Int31n(300)))
+	rf.logger(logger.DTimer, "Reset the election timeout = ", rf.getElectiontimeout())
+}
+
+func (rf *Raft) logger(topic logger.LogTopic, a ...interface{}) {
+	pre := fmt.Sprintf("N%v ", rf.me)
+	content := fmt.Sprint(a...)
+	logger.Debug(topic, pre+content)
 }
 
 // return currentTerm and whether this server
@@ -272,7 +377,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.setRole(FOLLOWER)
 		rf.setVotedFor(-1)
 	}
-	rf.fmt("Receive RequestVote Request from Node", args.CandidateId, "Term", args.Term)
+	rf.logger(logger.DVote, "Receive RequestVote Request from N", args.CandidateId, "T", args.Term)
 
 	reply.VoteGranted = false
 
@@ -281,13 +386,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	vf := rf.getVotedFor()
 
-	if (vf == -1 || vf == args.CandidateId) && args.LastLogIndex >= len(rf.getLog()) {
+	if (vf == -1 || vf == args.CandidateId) && args.LastLogIndex >= rf.getCommitIndex() {
 		reply.VoteGranted = true
 		reply.Term = rf.getCurrentTerm()
 		rf.setVotedFor(args.CandidateId)
-		rf.randomElectionTimeout()
+		rf.randomElectiontimeout()
 	}
-	rf.fmt("Vote ", reply.VoteGranted, "for Node", args.CandidateId)
+	rf.logger(logger.DVote, "Vote ", reply.VoteGranted, " for N", args.CandidateId, " status: vf=", vf, "  args.LastLogIndex=", args.LastLogIndex, " ")
 	return
 }
 
@@ -318,53 +423,57 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args.Term > rf.getCurrentTerm() {
+		rf.logger(logger.DWarn, "Receive the AppendEntries Request args.Term > rf.getCurrentTerm()")
 		rf.setCurrentTerm(args.Term)
 		rf.setVotedFor(-1)
 		rf.setRole(FOLLOWER)
-		rf.randomElectionTimeout()
+		rf.randomElectiontimeout()
 	}
 
-	rf.fmt("Receive AppendEntries Request from Node", args.LeaderId, "Term", args.Term)
+	rf.logger(logger.DClient, "Receive AppendEntries Request from N", args.LeaderId, " T", args.Term)
 
 	reply.Term = rf.getCurrentTerm()
 	reply.Success = false
 
 	if args.Term < rf.getCurrentTerm() {
+		rf.logger(logger.DError, "Refuse the AppendEntries Request args.Term < rf.getCurrentTerm()")
 		return
 	}
 
-	rf.randomElectionTimeout()
+	rf.randomElectiontimeout()
 
 	entries_length := len(rf.getLog())
 
-	if entries_length < args.PrevLogIndex || args.PrevLogIndex-1 >= 0 && rf.getLog()[args.PrevLogIndex-1].Term != args.PreLogTerm {
+	if entries_length < args.PrevLogIndex || args.PrevLogIndex >= 1 && rf.getLog()[args.PrevLogIndex-1].Term != args.PreLogTerm {
+		rf.logger(logger.DError, "Doesn't contain an entry at prevLogIndex ", args.PrevLogIndex, " whose term matches prevLogTerm")
 		reply.Success = false
 		return
 	}
 
 	rf.setVotedFor(args.LeaderId)
 	// Find the matched
-	rf.mu.Lock()
+	rf.logger(logger.DLog, "New comming log entries start at index ", args.PrevLogIndex+1, ":", args.Entries)
 	for index := 0; index < len(args.Entries); index += 1 {
 		if args.PrevLogIndex+index < len(rf.log) {
 			if rf.log[args.PrevLogIndex+index].Term != args.Entries[index].Term {
 				// conflic
-				logCopy := make([]LogEntry, args.PrevLogIndex)
-				copy(logCopy, rf.log[0:args.PrevLogIndex])
-				logCopy = append(logCopy, args.Entries...)
-				rf.log = logCopy
+				rf.logger(logger.DWarn, "Log Entry Conflict happens at index ", args.PrevLogIndex+index+1, ", remove the entries start from this place.")
+				rf.appendLogEntriesAt(args.PrevLogIndex+index, args.Entries[index:])
+				break
 			}
 		} else {
-			rf.log = append(rf.log, args.Entries[index:]...)
+			rf.logger(logger.DLog, "Append log entries: ", args.Entries[index:])
+			rf.appendLogEntries(args.Entries[index:])
 			break
 		}
 	}
-	rf.mu.Unlock()
 	if args.LeaderCommit > rf.getCommitIndex() {
-		rf.setCommitIndex(len(rf.getLog()))
-		if args.LeaderCommit < rf.getCommitIndex() {
-			rf.setCommitIndex(args.LeaderCommit)
+		rf.logger(logger.DLog, "args.LeaderCommit > rf.getCommitIndex()")
+		ci := len(rf.getLog())
+		if args.LeaderCommit < ci {
+			ci = args.LeaderCommit
 		}
+		rf.setCommitIndex(ci)
 	}
 	reply.Success = true
 	return
@@ -426,10 +535,18 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
+	isLeader := true
+	if rf.getRole() != LEADER {
+		isLeader = false
+	} else {
+		entries := make([]LogEntry, 1)
+		entries[0] = LogEntry{rf.getCurrentTerm(), command}
+		rf.appendLogEntries(entries)
+		index = len(rf.getLog())
+		term = rf.getCurrentTerm()
+	}
+	rf.logger(logger.DLog2, "index = ", index, " term = ", term, " isLeader = ", isLeader)
 	return index, term, isLeader
 }
 
@@ -447,7 +564,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.fmt("Killed")
+	rf.logger(logger.DInfo, "Killed")
 }
 
 func (rf *Raft) killed() bool {
@@ -464,10 +581,6 @@ func (rf *Raft) startElection() bool {
 	rf.setVotedFor(rf.me)
 	voteChannel <- rf.currentTerm
 
-	rf.randomElectionTimeout()
-
-	rf.fmt("Start a new Election with timeout", RPC_TIMEOUT)
-
 	// voteChannel <- rf.currentTerm
 	for i := 0; i < len(rf.peers) && !rf.killed(); i += 1 {
 		go func(i int) {
@@ -475,17 +588,17 @@ func (rf *Raft) startElection() bool {
 				args := RequestVoteArgs{}
 				args.Term = rf.getCurrentTerm()
 				args.CandidateId = rf.me
-				args.LastLogIndex = len(rf.getLog())
+				args.LastLogIndex = rf.getCommitIndex()
 				if args.LastLogIndex == 0 {
 					args.LastLogTerm = 0
 				} else {
 					args.LastLogTerm = rf.getLog()[args.LastLogIndex-1].Term
 				}
 				reply := RequestVoteReply{}
-				rf.fmt("Send vote Requset to Node", i)
+				rf.logger(logger.DVote, "Send vote Requset to N", i)
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok {
-					rf.fmt("Receive reply from Node", i)
+					rf.logger(logger.DVote, "Receive reply from N", i)
 					if reply.VoteGranted {
 						voteChannel <- reply.Term
 					}
@@ -497,29 +610,29 @@ func (rf *Raft) startElection() bool {
 					}
 
 				} else {
-					rf.fmt("Error to receive reply of RequestVote from Node", i)
+					rf.logger(logger.DVote, "Error to receive reply of RequestVote from N", i)
 				}
 			}
 		}(i)
 	}
 
-	rf.fmt("Sleep", RPC_TIMEOUT, "ms for Election")
-	time.Sleep(time.Millisecond * time.Duration(RPC_TIMEOUT))
+	rf.logger(logger.DVote, "Sleep ", RPC_timeout, "ms for Election")
+	time.Sleep(time.Millisecond * time.Duration(RPC_timeout))
 	voteChannel <- -1
-	rf.fmt("Current election timeout")
+	rf.logger(logger.DVote, "Current election timeout")
 	voteCount := 0
 	for !rf.killed() && rf.getVotedFor() == rf.me {
 		voteTerm, ok := <-voteChannel
 		if ok && voteTerm >= 0 {
 			voteCount += 1
-			rf.fmt("Result of the Election, vote as Leader of Term ", voteTerm, ", vote count now is", voteCount)
+			rf.logger(logger.DVote, "Result of the Election, vote as Leader of T", voteTerm, ", vote count now is ", voteCount)
 		} else {
 			break
 		}
 	}
 
 	result := voteCount > len(rf.peers)/2
-	rf.fmt("The Election result is", result)
+	rf.logger(logger.DVote, "The Election result is ", result)
 
 	return result
 }
@@ -534,58 +647,128 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		// Check heartbeat count during
-		lastElectionTimeout := rf.getElectionTimeout()
-		rf.fmt("Sleep", lastElectionTimeout, "ms")
-		time.Sleep(time.Duration(lastElectionTimeout) * time.Millisecond)
+		lastElectiontimeout := rf.getElectiontimeout()
+		rf.logger(logger.DTimer, "Sleep ", lastElectiontimeout, "ms")
+		time.Sleep(time.Duration(lastElectiontimeout) * time.Millisecond)
 
-		for rf.killed() == false && rf.getElectionTimeout() == lastElectionTimeout {
+		for rf.killed() == false && rf.getElectiontimeout() == lastElectiontimeout {
 			// Become Candidate
 			// Start Election
-			rf.fmt("HeartBeat timeout, becomes Candidate!")
+			rf.logger(logger.DWarn, "HeartBeat timeout, becomes Candidate!")
+			rf.randomElectiontimeout()
+			rf.logger(logger.DVote, "Start a new Election with timeout ", RPC_timeout, ", update lastElectiontimeout")
+			lastElectiontimeout = rf.getElectiontimeout()
 			electionResult := rf.startElection()
 			if electionResult {
-				rf.fmt("Win the election, becomes Leader")
-
-				// reinitialize leader's volatile state
+				rf.logger(logger.DLeader, "Send heartbeats to all other peers immediately.")
+				for i := 0; i < len(rf.peers); i += 1 {
+					go func(i int) {
+						if i != rf.me {
+							args := AppendEntriesArgs{}
+							args.Term = rf.getCurrentTerm()
+							args.LeaderId = rf.me
+							reply := AppendEntriesReply{}
+							rf.sendAppendEntries(i, &args, &reply)
+						}
+					}(i)
+				}
 				rf.setRole(LEADER)
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
 				for i := 0; i < len(rf.peers); i += 1 {
-					rf.nextIndex[i] = 1 + len(rf.peers)
+					rf.setNextIndex(i, 1+len(rf.getLog()))
 				}
 
-				for !rf.killed() {
-					// heartBeatCh := make(chan bool, len(rf.peers)+1)
-					// defer close(heartBeatCh)
-					args := AppendEntriesArgs{}
-					args.Term = rf.getCurrentTerm()
-					args.LeaderId = rf.me
-					// Send HeartBeat
+				for !rf.killed() && rf.getRole() == LEADER {
+					// check matchIndex, find the N, N > commitIndex && N <= majority of matchIndex
+					matchIndexArray := make([]int, len(rf.getMatchIndexAll()))
+					copy(matchIndexArray, rf.getMatchIndexAll())
+					sort.Slice(matchIndexArray, func(i, j int) bool {
+						return matchIndexArray[i] < matchIndexArray[j]
+					})
+					N := matchIndexArray[len(matchIndexArray)/2]
+					if N > rf.getCommitIndex() {
+						rf.logger(logger.DCommit, "Found an N > commitIndex && N <= majority of matchIndex")
+						rf.setCommitIndex(N)
+					}
+
+					rf.logger(logger.DLeader, "Current matchIndex: ", rf.getMatchIndexAll(), " commitIndex: ", rf.getCommitIndex(), " nextIndex: ", rf.getNextIndexAll(), " len(rf.log): ", len(rf.getLog()))
+
 					for i := 0; i < len(rf.peers); i += 1 {
-						if i != rf.me {
-							rf.fmt("Send HeartBeart to Node", i)
-							go func(i int) {
+						go func(i int) {
+							if i == rf.me {
+								rf.setMatchIndex(i, len(rf.getLog()))
+								rf.setNextIndex(i, len(rf.getLog())+1)
+								return
+							}
+							rf.logger(logger.DLeader, "rf.getNextIndex(i)=", rf.getNextIndex(i), " ,len(rf.getLog())=", len(rf.getLog()))
+
+							for !rf.killed() && rf.getRole() == LEADER {
+								args := AppendEntriesArgs{}
+								args.Term = rf.getCurrentTerm()
+								args.LeaderId = rf.me
+								args.LeaderCommit = rf.getCommitIndex()
+								args.PrevLogIndex = rf.getNextIndex(i) - 1
+								if args.PrevLogIndex-1 >= 0 {
+									args.PreLogTerm = rf.getLog()[args.PrevLogIndex-1].Term
+								} else {
+									args.PreLogTerm = 0
+								}
+								// limit the size of Entires to up to LIMITED_ENTRIES_COUNT
+								rightIndex := args.PrevLogIndex + LIMITED_ENTRIES_COUNT
+								if rightIndex > len(rf.getLog()) {
+									rightIndex = len(rf.getLog())
+								}
+
+								args.Entries = rf.getLog()[args.PrevLogIndex:rightIndex]
+
+								rf.logger(logger.DLeader, "Send AppendEntries to N", i, " len(Entries)= ", len(args.Entries))
 								reply := AppendEntriesReply{}
 								ok := rf.sendAppendEntries(i, &args, &reply)
+								rf.logger(logger.DTest, "Send Entry at Index: ", args.PrevLogIndex, " to N", i, " len(entries)=", len(args.Entries))
 								if ok {
+									rf.logger(logger.DLeader, "Receive reply from N", i)
 									if reply.Term > rf.getCurrentTerm() {
-										rf.fmt("Becomes follower from Leader Node", i)
+										rf.logger(logger.DWarn, "Becomes follower of Leader N", i)
+										rf.setRole(FOLLOWER)
 										rf.setCurrentTerm(args.Term)
+										break
 									}
+									if reply.Success {
+										rf.logger(logger.DLeader, "Update matchIndex, args.PrevLogIndex=", args.PrevLogIndex, ",  len(args.Entries)=", len(args.Entries))
+										rf.setMatchIndex(i, args.PrevLogIndex+len(args.Entries))
+										rf.setNextIndex(i, rf.getMatchIndex(i)+1)
+										break
+									} else {
+										rf.setNextIndex(i, rf.getNextIndex(i)-1)
+										rf.logger(logger.DLog, "Fail to replicate log entries, decrease nextIndex[", i, "] , then retry")
+										if rf.getNextIndex(i) <= rf.getCommitIndex() {
+											rf.logger(logger.DError, "nextIndex[", i, "] <= commited index ", rf.getCommitIndex(), "error condition! Fail to replicate entries.")
+											break
+										}
+									}
+
+								} else {
+									rf.logger("Fail to receive reply from N", i)
 								}
-							}(i)
-						}
+							}
+						}(i)
 					}
 
 					time.Sleep(time.Duration(rf.heartbeatInterval) * time.Millisecond)
 
 					if rf.killed() {
-						rf.fmt("Get Killed")
-						rf.fmt("Stop sending HearBeats")
+						rf.logger(logger.DWarn, "Get Killed, stop sending HearBeats")
 						break
 					}
-					if rf.getElectionTimeout() != lastElectionTimeout || rf.getVotedFor() != rf.me {
-						rf.fmt("Stop sending HearBeats")
+					if rf.getElectiontimeout() != lastElectiontimeout || rf.getVotedFor() != rf.me {
+						if rf.getElectiontimeout() != lastElectiontimeout {
+							rf.logger(logger.DError, "Condition Error: rf.getElectiontimeout() != lastElectiontimeout is False, rf.getElectiontimeout() = ", rf.getElectiontimeout(), ", lastElectiontimeout = ", lastElectiontimeout)
+						} else if rf.getVotedFor() != rf.me {
+							rf.logger(logger.DError, "Condition Error: rf.getVotedFor() != rf.me is False, rf.getVotedFor() = ", rf.getVotedFor(), ", rf.me = ", rf.me)
+						}
+
+						rf.logger(logger.DWarn, "Stop sending HearBeats")
 						break
 					}
 				}
@@ -628,8 +811,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.rand = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
 	rf.heartbeatInterval = HEARTBEAT_INTERVAL
 
-	// rf.randomElectionTimeout()
-	rf.fmt("Make a newborn")
+	rf.applyCh = applyCh
+	rf.logger(logger.DInfo, "Make a newborn")
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
