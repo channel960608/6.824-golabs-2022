@@ -19,7 +19,6 @@ package raft
 
 import (
 	//	"bytes"
-
 	"fmt"
 	"math/rand"
 	"sort"
@@ -271,8 +270,6 @@ func (rf *Raft) randomElectiontimeout() {
 }
 
 func (rf *Raft) logger(topic logger.LogTopic, a ...interface{}) {
-	// content := fmt.Printf("Node", rf.me, "Term", rf.getCurrentTerm(), "votedFor", rf.getVotedFor(), "commitIndex", rf.getCommitIndex(), ":", a)
-	// pre := fmt.Sprintf("N:%dT:%dV:%d: ", rf.me, rf.getCurrentTerm(), rf.getVotedFor())
 	pre := fmt.Sprintf("N%v ", rf.me)
 	content := fmt.Sprint(a...)
 	logger.Debug(topic, pre+content)
@@ -478,7 +475,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.setCommitIndex(ci)
 	}
-	// rf.logger(logger.DClient, "Current entries: ", rf.getLog(), " rf.commitIndex()=", rf.getCommitIndex())
 	reply.Success = true
 	return
 }
@@ -718,14 +714,13 @@ func (rf *Raft) ticker() {
 								} else {
 									args.PreLogTerm = 0
 								}
-								// limit the size of Entires to up to 5
+								// limit the size of Entires to up to LIMITED_ENTRIES_COUNT
 								rightIndex := args.PrevLogIndex + LIMITED_ENTRIES_COUNT
 								if rightIndex > len(rf.getLog()) {
 									rightIndex = len(rf.getLog())
 								}
 
 								args.Entries = rf.getLog()[args.PrevLogIndex:rightIndex]
-								// args.Entries = rf.getLog()[rf.getNextIndex(i)-1:]
 
 								rf.logger(logger.DLeader, "Send AppendEntries to N", i, " len(Entries)= ", len(args.Entries))
 								reply := AppendEntriesReply{}
@@ -817,7 +812,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatInterval = HEARTBEAT_INTERVAL
 
 	rf.applyCh = applyCh
-	// rf.randomElectiontimeout()
 	rf.logger(logger.DInfo, "Make a newborn")
 
 	// initialize from state persisted before a crash
