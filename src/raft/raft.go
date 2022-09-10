@@ -385,8 +385,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	vf := rf.getVotedFor()
-
-	if (vf == -1 || vf == args.CandidateId) && args.LastLogIndex >= rf.getCommitIndex() {
+	lastIndex := len(rf.getLog())
+	lastTerm := 0
+	if lastIndex != 0 {
+		lastTerm = rf.getLog()[lastIndex-1].Term
+	}
+	// The definition of more up-to-date log: the index of the last entry is larger || the index of the last entry is the same but have larger term
+	if (vf == -1 || vf == args.CandidateId) && (args.LastLogTerm > lastTerm || args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex) {
 		reply.VoteGranted = true
 		reply.Term = rf.getCurrentTerm()
 		rf.setVotedFor(args.CandidateId)
@@ -414,14 +419,16 @@ type AppendEntriesArgs struct {
 // field names must start with capital letters!
 //
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term                   int
+	Success                bool
+	FirstIndexConflictTerm int
 }
 
 //
 // example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.logger(logger.DClient, "Entries: ", rf.getLog())
 	if args.Term > rf.getCurrentTerm() {
 		rf.logger(logger.DWarn, "Receive the AppendEntries Request args.Term > rf.getCurrentTerm()")
 		rf.setCurrentTerm(args.Term)
@@ -443,6 +450,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.randomElectiontimeout()
 
 	entries_length := len(rf.getLog())
+
+	// Find the first index of the current Term
+	targetIndex := entries_length
+	for targetIndex > rf.getCommitIndex()+1 && rf.getLog()[targetIndex-1].Term == rf.getCurrentTerm() {
+		targetIndex -= 1
+	}
+	reply.FirstIndexConflictTerm = targetIndex
 
 	if entries_length < args.PrevLogIndex || args.PrevLogIndex >= 1 && rf.getLog()[args.PrevLogIndex-1].Term != args.PreLogTerm {
 		rf.logger(logger.DError, "Doesn't contain an entry at prevLogIndex ", args.PrevLogIndex, " whose term matches prevLogTerm")
@@ -588,7 +602,7 @@ func (rf *Raft) startElection() bool {
 				args := RequestVoteArgs{}
 				args.Term = rf.getCurrentTerm()
 				args.CandidateId = rf.me
-				args.LastLogIndex = rf.getCommitIndex()
+				args.LastLogIndex = len(rf.getLog())
 				if args.LastLogIndex == 0 {
 					args.LastLogTerm = 0
 				} else {
@@ -693,6 +707,7 @@ func (rf *Raft) ticker() {
 					}
 
 					rf.logger(logger.DLeader, "Current matchIndex: ", rf.getMatchIndexAll(), " commitIndex: ", rf.getCommitIndex(), " nextIndex: ", rf.getNextIndexAll(), " len(rf.log): ", len(rf.getLog()))
+					// rf.logger(logger.DLeader, "Entries: ", rf.getLog())
 
 					for i := 0; i < len(rf.peers); i += 1 {
 						go func(i int) {
@@ -740,8 +755,20 @@ func (rf *Raft) ticker() {
 										rf.setNextIndex(i, rf.getMatchIndex(i)+1)
 										break
 									} else {
-										rf.setNextIndex(i, rf.getNextIndex(i)-1)
-										rf.logger(logger.DLog, "Fail to replicate log entries, decrease nextIndex[", i, "] , then retry")
+										// Optimization: decrease the  nextIndex[i] back to the first index of conflict Term
+										pre := rf.getNextIndex(i)
+										if reply.FirstIndexConflictTerm > rf.getNextIndex(i)-1 {
+											rf.logger(logger.DWarn, "NextIndex doesn't decrease!")
+											if rf.getNextIndex(i) > 1 {
+												rf.setNextIndex(i, rf.getNextIndex(i)-1)
+											}
+										} else if reply.FirstIndexConflictTerm <= rf.getMatchIndex(i)+1 {
+											rf.setNextIndex(i, rf.getMatchIndex(i)+1)
+										} else {
+											rf.setNextIndex(i, reply.FirstIndexConflictTerm)
+										}
+
+										rf.logger(logger.DLog, "Fail to replicate log entries, decrease nextIndex[", i, "] ", pre, " -> ", rf.getNextIndex(i))
 										if rf.getNextIndex(i) <= rf.getCommitIndex() {
 											rf.logger(logger.DError, "nextIndex[", i, "] <= commited index ", rf.getCommitIndex(), "error condition! Fail to replicate entries.")
 											break
@@ -773,7 +800,7 @@ func (rf *Raft) ticker() {
 					}
 				}
 			}
-
+			time.Sleep(time.Duration(rf.getElectiontimeout()) * time.Millisecond)
 		}
 
 	}
