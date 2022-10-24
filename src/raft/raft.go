@@ -318,6 +318,7 @@ func (rf *Raft) syncApplyCh() {
 	for !rf.killed() {
 		commitIndex := rf.getCommitIndex()
 		lastAppliedIndex := rf.getLastApplyIndex()
+		preSyncedIndex := lastAppliedIndex
 		if commitIndex > lastAppliedIndex {
 			for v := lastAppliedIndex + 1; v <= commitIndex; v += 1 {
 				am := ApplyMsg{}
@@ -331,8 +332,9 @@ func (rf *Raft) syncApplyCh() {
 				am.Command = log[v-1].Command
 				rf.applyCh <- am
 				rf.logger(logger.DCommit, "Send ApplyMsg to applyCh for command index ", am.CommandIndex, " Command = ", am.Command)
-				rf.setLastApplyIndex(v)
+				preSyncedIndex = v
 			}
+			rf.setLastApplyIndex(preSyncedIndex)
 		}
 		time.Sleep(time.Millisecond * time.Duration(RPC_timeout))
 	}
@@ -341,7 +343,7 @@ func (rf *Raft) syncApplyCh() {
 func (rf *Raft) randomElectiontimeout() {
 	var nextRandomValue int
 	rf.mu.Lock()
-	nextRandomValue = 200 + int(rf.rand.Int31n(300))
+	nextRandomValue = 300 + int(rf.rand.Int31n(300))
 	rf.mu.Unlock()
 	rf.setElectiontimeout(nextRandomValue)
 	rf.logger(logger.DTimer, "Reset the election timeout = ", rf.getElectiontimeout())
@@ -540,11 +542,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	mLen := len(rf.log)
 	// Find the first index of the current Term
+
+	// for targetIndex > rf.commitIndex && rf.log[targetIndex-1].Term == rf.currentTerm {
+	// 	targetIndex -= 1
+	// }
+	// reply.FirstIndexConflictTerm = targetIndex - 1
 	targetIndex := mLen
-	for targetIndex > rf.commitIndex+1 && rf.log[targetIndex-1].Term == rf.currentTerm {
+	for targetIndex > 0 && rf.log[targetIndex-1].Term == args.Term {
 		targetIndex -= 1
 	}
-	reply.FirstIndexConflictTerm = targetIndex
+	reply.FirstIndexConflictTerm = targetIndex + 1
 
 	if mLen < args.PrevLogIndex || args.PrevLogIndex >= 1 && rf.log[args.PrevLogIndex-1].Term != args.PreLogTerm {
 		rf.logger(logger.DError, "Doesn't contain an entry at prevLogIndex ", args.PrevLogIndex, " whose term matches prevLogTerm")
@@ -562,8 +569,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[args.PrevLogIndex+index].Term != args.Entries[index].Term {
 				// conflic
 				rf.logger(logger.DWarn, "Log Entry Conflict happens at index ", args.PrevLogIndex+index+1, ", remove the entries start from this place.")
-				rf.appendLogEntriesAt(args.PrevLogIndex+index, args.Entries[index:])
-				break
+				// rf.appendLogEntriesAt(args.PrevLogIndex+index, args.Entries[index:])
+				rf.mu.Unlock()
+				rf.removeFollowingLogEntriesWithLock(args.PrevLogIndex + index)
+				return
 			}
 		} else {
 			rf.logger(logger.DLog, "Append log entries: ", args.Entries[index:])
@@ -641,16 +650,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	// Your code here (2B).
-	isLeader := true
-	if rf.getRole() != LEADER {
-		isLeader = false
-	} else {
+	if rf.getRole() == LEADER {
 		entries := make([]LogEntry, 1)
 		entries[0] = LogEntry{rf.getCurrentTerm(), command}
 		index, term = rf.appendLogEntriesWithLock(entries)
 	}
-	rf.logger(logger.DLog2, "index = ", index, " term = ", term, " isLeader = ", isLeader)
-	return index, term, isLeader
+	defer rf.logger(logger.DLog2, "index = ", index, " term = ", term, " isLeader = ", rf.getRole() == LEADER)
+	return index, term, rf.getRole() == LEADER
 }
 
 //
@@ -677,7 +683,8 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) startElection() bool {
 	voteChannel := make(chan int, len(rf.peers)+1)
-	defer close(voteChannel)
+	replyCount := 0
+	var replyCountMutex sync.Mutex
 	rf.setRole(CANDIDATE)
 	rf.setCurrentTerm(rf.getCurrentTerm() + 1)
 	rf.setVotedFor(rf.me)
@@ -716,6 +723,13 @@ func (rf *Raft) startElection() bool {
 				} else {
 					rf.logger(logger.DVote, "Error to receive reply of RequestVote from N", i)
 				}
+
+				replyCountMutex.Lock()
+				replyCount += 1
+				if replyCount >= len(rf.peers) {
+					close(voteChannel)
+				}
+				replyCountMutex.Unlock()
 			}
 		}(i)
 	}
@@ -782,15 +796,15 @@ func (rf *Raft) ticker() {
 				}
 
 				for !rf.killed() && rf.getRole() == LEADER {
-					// check matchIndex, find the N, N > commitIndex && N <= majority of matchIndex
+					// check matchIndex, find the N, N > commitIndex && N <= majority of matchIndex && log[N].term == currentTerm
 					matchIndexArray := make([]int, len(rf.getMatchIndexAll()))
 					copy(matchIndexArray, rf.getMatchIndexAll())
 					sort.Slice(matchIndexArray, func(i, j int) bool {
 						return matchIndexArray[i] < matchIndexArray[j]
 					})
 					N := matchIndexArray[len(matchIndexArray)/2]
-					if N > rf.getCommitIndex() {
-						rf.logger(logger.DCommit, "Found an N > commitIndex && N <= majority of matchIndex")
+					if N > rf.getCommitIndex() && rf.getLog()[N-1].Term == rf.getCurrentTerm() {
+						rf.logger(logger.DCommit, "Found an N > commitIndex && N <= majority of matchIndex && log[N].term == currentTerm")
 						rf.setCommitIndex(N)
 					}
 
@@ -804,7 +818,8 @@ func (rf *Raft) ticker() {
 								return
 							}
 							rf.logger(logger.DLeader, "rf.getNextIndex(i)=", rf.getNextIndex(i), " ,len(rf.getLog())=", len(rf.getLog()))
-							for !rf.killed() && rf.getRole() == LEADER && timeout == rf.getElectiontimeout() {
+							t0 := time.Now()
+							for time.Since(t0).Seconds() < 3 && !rf.killed() && rf.getRole() == LEADER && timeout == rf.getElectiontimeout() {
 								args := AppendEntriesArgs{}
 								args.Term = rf.getCurrentTerm()
 								args.LeaderId = rf.me
@@ -822,7 +837,7 @@ func (rf *Raft) ticker() {
 								rf.logger(logger.DLeader, "Send AppendEntries to N", i, " len(Entries)= ", len(args.Entries))
 								reply := AppendEntriesReply{}
 								ok := rf.sendAppendEntries(i, &args, &reply)
-								rf.logger(logger.DTest, "Send Entry at Index: ", args.PrevLogIndex, " to N", i, " len(entries)=", len(args.Entries))
+								rf.logger(logger.DLeader, "Send Entry at Index: ", args.PrevLogIndex, " to N", i, " len(entries)=", len(args.Entries))
 								if ok {
 									rf.logger(logger.DLeader, "Receive reply from N", i)
 									if reply.Term > rf.getCurrentTerm() {
@@ -839,12 +854,15 @@ func (rf *Raft) ticker() {
 									} else {
 										// Optimization: decrease the  nextIndex[i] back to the first index of conflict Term
 										pre := rf.getNextIndex(i)
-										if reply.FirstIndexConflictTerm == 0 {
-											rf.setNextIndex(i, 1)
-										} else if reply.FirstIndexConflictTerm > pre-1 {
-											rf.logger(logger.DWarn, "NextIndex doesn't decrease!")
+										if reply.FirstIndexConflictTerm >= pre {
+											rf.logger(logger.DWarn, "NextIndex doesn't decrease! reply.FirstIndexConflictTerm: ", reply.FirstIndexConflictTerm, " >= pre: ", pre)
 											if pre > 1 {
-												rf.setNextIndex(i, pre-1)
+												rf.logger(logger.DWarn, "Find the index of the first entry with term = ", rf.getLog()[pre-2].Term)
+												firstIndexConflictTerm := pre - 1
+												for firstIndexConflictTerm > 0 && rf.getLog()[firstIndexConflictTerm-1].Term == rf.getLog()[pre-2].Term {
+													firstIndexConflictTerm -= 1
+												}
+												rf.setNextIndex(i, firstIndexConflictTerm)
 											}
 										} else {
 											rf.setNextIndex(i, reply.FirstIndexConflictTerm)
