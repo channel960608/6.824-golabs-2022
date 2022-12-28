@@ -583,6 +583,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
+	rf.mu.Unlock()
 	if args.LeaderCommit > rf.getCommitIndex() {
 		rf.logger(logger.DLog, "args.LeaderCommit > rf.getCommitIndex()")
 		ci := len(rf.getLog())
