@@ -541,21 +541,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	mLen := len(rf.log)
-	// Find the first index of the current Term
-
-	// for targetIndex > rf.commitIndex && rf.log[targetIndex-1].Term == rf.currentTerm {
-	// 	targetIndex -= 1
-	// }
-	// reply.FirstIndexConflictTerm = targetIndex - 1
-	targetIndex := mLen
-	for targetIndex > 0 && rf.log[targetIndex-1].Term == args.Term {
-		targetIndex -= 1
-	}
-	reply.FirstIndexConflictTerm = targetIndex + 1
 
 	if mLen < args.PrevLogIndex || args.PrevLogIndex >= 1 && rf.log[args.PrevLogIndex-1].Term != args.PreLogTerm {
 		rf.logger(logger.DError, "Doesn't contain an entry at prevLogIndex ", args.PrevLogIndex, " whose term matches prevLogTerm")
 		reply.Success = false
+		// Find the first index of the current Term
+		if mLen < args.PrevLogIndex {
+			reply.FirstIndexConflictTerm = mLen
+			rf.logger(logger.DError, "Followers log entries are shorter than args.PrevLogIndex = ", args.PrevLogIndex, ", set reply.FirstIndexConflictTerm=", reply.FirstIndexConflictTerm)
+		} else {
+			rf.logger(logger.DError, "Follower's entry's term = ", rf.log[args.PrevLogIndex-1].Term, " at args.PrevLogIndex = ", args.PrevLogIndex, " conflict with the one sent by leader.")
+			tterm := rf.log[args.PrevLogIndex-1].Term
+			targetIndex := args.PrevLogIndex
+			for targetIndex > 0 && rf.log[targetIndex-1].Term == tterm {
+				targetIndex -= 1
+			}
+			reply.FirstIndexConflictTerm = targetIndex + 1
+			rf.logger(logger.DError, "Find this Term's first entry's index reply.FirstIndexConflictTerm=", reply.FirstIndexConflictTerm)
+		}
+
 		rf.mu.Unlock()
 		return
 	}
@@ -569,7 +573,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[args.PrevLogIndex+index].Term != args.Entries[index].Term {
 				// conflic
 				rf.logger(logger.DWarn, "Log Entry Conflict happens at index ", args.PrevLogIndex+index+1, ", remove the entries start from this place.")
-				// rf.appendLogEntriesAt(args.PrevLogIndex+index, args.Entries[index:])
 				rf.mu.Unlock()
 				rf.removeFollowingLogEntriesWithLock(args.PrevLogIndex + index)
 				return
@@ -838,7 +841,7 @@ func (rf *Raft) ticker() {
 								reply := AppendEntriesReply{}
 								ok := rf.sendAppendEntries(i, &args, &reply)
 								rf.logger(logger.DLeader, "Send Entry at Index: ", args.PrevLogIndex, " to N", i, " len(entries)=", len(args.Entries))
-								if ok {
+								if rf.getRole() == LEADER && ok {
 									rf.logger(logger.DLeader, "Receive reply from N", i)
 									if reply.Term > rf.getCurrentTerm() {
 										rf.logger(logger.DWarn, "Becomes follower of Leader N", i)
@@ -854,19 +857,23 @@ func (rf *Raft) ticker() {
 									} else {
 										// Optimization: decrease the  nextIndex[i] back to the first index of conflict Term
 										pre := rf.getNextIndex(i)
-										if reply.FirstIndexConflictTerm >= pre {
-											rf.logger(logger.DWarn, "NextIndex doesn't decrease! reply.FirstIndexConflictTerm: ", reply.FirstIndexConflictTerm, " >= pre: ", pre)
-											if pre > 1 {
-												rf.logger(logger.DWarn, "Find the index of the first entry with term = ", rf.getLog()[pre-2].Term)
-												firstIndexConflictTerm := pre - 1
-												for firstIndexConflictTerm > 0 && rf.getLog()[firstIndexConflictTerm-1].Term == rf.getLog()[pre-2].Term {
-													firstIndexConflictTerm -= 1
-												}
-												rf.setNextIndex(i, firstIndexConflictTerm)
-											}
-										} else {
-											rf.setNextIndex(i, reply.FirstIndexConflictTerm)
+										// if reply.FirstIndexConflictTerm >= pre {
+										// 	rf.logger(logger.DWarn, "NextIndex doesn't decrease! reply.FirstIndexConflictTerm: ", reply.FirstIndexConflictTerm, " >= pre: ", pre)
+										// 	if pre > 1 {
+										// 		rf.logger(logger.DWarn, "Find the index of the first entry with term = ", rf.getLog()[pre-2].Term)
+										// 		firstIndexConflictTerm := pre - 1
+										// 		for firstIndexConflictTerm > 0 && rf.getLog()[firstIndexConflictTerm-1].Term == rf.getLog()[pre-2].Term {
+										// 			firstIndexConflictTerm -= 1
+										// 		}
+										// 		rf.setNextIndex(i, firstIndexConflictTerm)
+										// 	}
+										// } else {
+										// 	rf.setNextIndex(i, reply.FirstIndexConflictTerm)
+										// }
+										if reply.FirstIndexConflictTerm <= 0 {
+											reply.FirstIndexConflictTerm = 1
 										}
+										rf.setNextIndex(i, reply.FirstIndexConflictTerm)
 
 										rf.logger(logger.DLog, "Fail to replicate log entries, decrease nextIndex[", i, "] ", pre, " -> ", rf.getNextIndex(i), " matchIndex[", i, "] = ", rf.getMatchIndex(i))
 										if rf.getNextIndex(i) <= 0 {
@@ -877,7 +884,7 @@ func (rf *Raft) ticker() {
 									}
 
 								} else {
-									rf.logger("Fail to receive reply from N", i)
+									rf.logger("Fail to receive reply from N or the node is not leader anymore", i)
 								}
 							}
 						}(i, rf.getElectiontimeout())
